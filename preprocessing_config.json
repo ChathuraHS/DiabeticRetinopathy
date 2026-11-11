@@ -1,0 +1,17 @@
+{
+    "image_size": [
+        1024,
+        1024
+    ],
+    "color_mode": "RGB",
+    "format": "JPEG",
+    "jpeg_quality": 95,
+    "resizing": "Aspect-ratio-preserving square padding",
+    "padding_color": [
+        0,
+        0,
+        0
+    ],
+    "resampling": "Lanczos",
+    "exif_orientation": true
+}

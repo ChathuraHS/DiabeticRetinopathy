@@ -1,0 +1,17 @@
+# Downloaded archives and dataset contents
+/downloads/
+/data/
+/reports/
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local secrets and editor/OS files
+.env
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
