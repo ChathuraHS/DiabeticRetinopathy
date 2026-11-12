@@ -1,3 +1,4 @@
+
 from pathlib import Path
 
 import pandas as pd
@@ -13,7 +14,6 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def extract_patient_id(image_id):
-    # Example: 10_left -> 10
     parts = image_id.rsplit("_", 1)
 
     if len(parts) != 2:
@@ -28,11 +28,11 @@ def extract_patient_id(image_id):
 
 
 def main():
+
     df = pd.read_csv(INPUT_FILE)
 
     df["patient_id"] = df["image"].apply(extract_patient_id)
 
-    # First split: 80% development data, 20% test data.
     outer_splitter = StratifiedGroupKFold(
         n_splits=5,
         shuffle=True,
@@ -50,8 +50,6 @@ def main():
     development = df.iloc[development_indices].copy()
     test = df.iloc[test_indices].copy()
 
-    # Second split: 80% of development for training,
-    # 20% of development for validation.
     inner_splitter = StratifiedGroupKFold(
         n_splits=5,
         shuffle=True,
@@ -82,6 +80,7 @@ def main():
     assert train_patients.isdisjoint(test_patients)
     assert validation_patients.isdisjoint(test_patients)
 
+    # Save split CSVs.
     train.to_csv(OUTPUT_DIR / "train.csv", index=False)
     validation.to_csv(OUTPUT_DIR / "validation.csv", index=False)
     test.to_csv(OUTPUT_DIR / "test.csv", index=False)

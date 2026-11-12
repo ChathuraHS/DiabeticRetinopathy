@@ -15,7 +15,7 @@ REPORT_DIR = PROJECT / "reports"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-IMAGE_SIZE = (1024, 1024)
+IMAGE_SIZE = (512, 512)
 JPEG_QUALITY = 95
 
 SPLITS = ["train", "validation", "test"]
