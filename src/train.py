@@ -7,85 +7,59 @@ import torch
 import torch.nn as nn
 import optuna
 
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import models
-from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import cohen_kappa_score
 from tqdm import tqdm
 
-from dataset import (
-    RetinopathyDataset,
-    TRAIN_TRANSFORM,
-    TEST_TRANSFORM
-)
+from dataset import RetinopathyDataset, TRAIN_TRANSFORM, TEST_TRANSFORM
 
 
 PROJECT = Path(r"D:\DiabeticRetinopathy")
 
 TRAIN_CSV = PROJECT / "data/splits/train.csv"
 VAL_CSV = PROJECT / "data/splits/validation.csv"
-
 MODEL_DIR = PROJECT / "models"
 
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_CUDA = DEVICE.type == "cuda"
 
-NUM_CLASSES = 5
+N_TRIALS = 6
+EPOCHS_PER_TRIAL = 4
+FINAL_EPOCHS = 25
+NUM_WORKERS = 4
 
-N_TRIALS = 5
-EPOCHS_PER_TRIAL = 5
-FINAL_EPOCHS = 10
+DEFAULT_THRESHOLDS = [0.5, 1.5, 2.5, 3.5]
 
+# Batch sizes that fit a 6 GB GPU with AMP at 512px
+BATCH_SIZES = {
+    "resnet18": [16, 32],
+    "efficientnet_b0": [8, 16],
+}
 
-# --------------------------------------------------
-# 1. Calculate class weights
-# --------------------------------------------------
-
-train_df = pd.read_csv(TRAIN_CSV)
-
-class_weights = compute_class_weight(
-    class_weight="balanced",
-    classes=np.array([0, 1, 2, 3, 4]),
-    y=train_df["level"].values
-)
-
-CLASS_WEIGHTS = torch.tensor(
-    class_weights,
-    dtype=torch.float32
-).to(DEVICE)
+torch.backends.cudnn.benchmark = True
 
 
 # --------------------------------------------------
-# 2. Load model
+# Model: single-output regression head
 # --------------------------------------------------
 
-def create_model(model_name, dropout):
+def create_model(model_name, dropout, pretrained=True):
 
     if model_name == "resnet18":
-
-        model = models.resnet18(
-            weights=models.ResNet18_Weights.DEFAULT
-        )
-
-        features = model.fc.in_features
-
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        model = models.resnet18(weights=weights)
         model.fc = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(features, NUM_CLASSES)
+            nn.Linear(model.fc.in_features, 1)
         )
 
     elif model_name == "efficientnet_b0":
-
-        model = models.efficientnet_b0(
-            weights=models.EfficientNet_B0_Weights.DEFAULT
-        )
-
-        features = model.classifier[1].in_features
-
+        weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+        model = models.efficientnet_b0(weights=weights)
         model.classifier = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(features, NUM_CLASSES)
+            nn.Linear(model.classifier[1].in_features, 1)
         )
 
     else:
@@ -95,293 +69,221 @@ def create_model(model_name, dropout):
 
 
 # --------------------------------------------------
-# 3. Data loaders
+# Data
 # --------------------------------------------------
 
 def create_loaders(batch_size):
 
-    train_dataset = RetinopathyDataset(
-        TRAIN_CSV,
-        TRAIN_TRANSFORM
+    train_ds = RetinopathyDataset(TRAIN_CSV, TRAIN_TRANSFORM)
+    val_ds = RetinopathyDataset(VAL_CSV, TEST_TRANSFORM)
+
+    # Softened class balancing: weight ~ 1/sqrt(class frequency)
+    labels = np.array(train_ds.labels)
+    counts = np.bincount(labels, minlength=5).astype(float)
+    sample_weights = (1.0 / np.sqrt(counts))[labels]
+
+    sampler = WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.double),
+        num_samples=len(train_ds),
+        replacement=True
     )
 
-    val_dataset = RetinopathyDataset(
-        VAL_CSV,
-        TEST_TRANSFORM
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
+    common = dict(
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=torch.cuda.is_available()
+        num_workers=NUM_WORKERS,
+        pin_memory=USE_CUDA,
+        persistent_workers=NUM_WORKERS > 0
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=torch.cuda.is_available()
-    )
+    train_loader = DataLoader(train_ds, sampler=sampler, **common)
+    val_loader = DataLoader(val_ds, shuffle=False, **common)
 
     return train_loader, val_loader
 
 
 # --------------------------------------------------
-# 4. Evaluation on validation data
+# Prediction, thresholds, TTA
 # --------------------------------------------------
 
-def validate(model, loader):
+def apply_thresholds(preds, thresholds=DEFAULT_THRESHOLDS):
+    return np.digitize(preds, thresholds)
 
-    model.eval()
 
-    actual = []
-    predicted = []
-
-    with torch.no_grad():
-
-        for images, labels in loader:
-
-            images = images.to(DEVICE)
-
-            outputs = model(images)
-
-            predictions = outputs.argmax(dim=1)
-
-            actual.extend(labels.numpy())
-            predicted.extend(predictions.cpu().numpy())
-
+def qwk_score(labels, preds, thresholds=DEFAULT_THRESHOLDS):
     return cohen_kappa_score(
-        actual,
-        predicted,
-        weights="quadratic"
+        labels, apply_thresholds(preds, thresholds), weights="quadratic"
     )
+
+
+@torch.no_grad()
+def predict_raw(model, loader, tta=False):
+    """Return (raw regression outputs, labels). TTA = mean over 4 flips."""
+    model.eval()
+    preds, labels_all = [], []
+
+    for images, labels in loader:
+        images = images.to(DEVICE, non_blocking=True)
+
+        views = [images]
+        if tta:
+            views += [images.flip(3), images.flip(2), images.flip(2).flip(3)]
+
+        out = 0
+        for v in views:
+            with torch.autocast(device_type=DEVICE.type,
+                                dtype=torch.float16, enabled=USE_CUDA):
+                out = out + model(v).float().squeeze(1)
+        out = out / len(views)
+
+        preds.append(out.cpu().numpy())
+        labels_all.append(labels.numpy())
+
+    return np.concatenate(preds), np.concatenate(labels_all)
+
+
+def optimise_thresholds(preds, labels, passes=3):
+    """Coordinate-descent search of the 4 cut-points to maximise QWK."""
+    thr = list(DEFAULT_THRESHOLDS)
+    best = qwk_score(labels, preds, thr)
+
+    for _ in range(passes):
+        for i in range(4):
+            for cand in np.linspace(thr[i] - 0.5, thr[i] + 0.5, 41):
+                trial = thr.copy()
+                trial[i] = cand
+                if trial != sorted(trial):
+                    continue
+                score = qwk_score(labels, preds, trial)
+                if score > best:
+                    best, thr = score, trial
+
+    return thr, best
 
 
 # --------------------------------------------------
-# 5. Train one configuration
+# Train one configuration
 # --------------------------------------------------
 
-def train_model(
-    model_name,
-    learning_rate,
-    weight_decay,
-    dropout,
-    batch_size,
-    epochs,
-    save_path=None
-):
+def train_model(model_name, learning_rate, weight_decay, dropout,
+                batch_size, epochs, save_path=None):
 
-    train_loader, val_loader = create_loaders(
-        batch_size
-    )
+    train_loader, val_loader = create_loaders(batch_size)
+    model = create_model(model_name, dropout)
 
-    model = create_model(
-        model_name,
-        dropout
-    )
-
-    criterion = nn.CrossEntropyLoss(
-        weight=CLASS_WEIGHTS
-    )
-
+    criterion = nn.SmoothL1Loss()
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
-
-    scaler = torch.amp.GradScaler(
-        "cuda",
-        enabled=torch.cuda.is_available()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=learning_rate * 0.01
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=USE_CUDA)
 
     best_qwk = -1.0
 
     for epoch in range(epochs):
 
         model.train()
-
         running_loss = 0.0
-
-        progress = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch + 1}/{epochs}"
-        )
+        progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}")
 
         for images, labels in progress:
+            images = images.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True).float()
 
-            images = images.to(DEVICE)
-            labels = labels.to(DEVICE)
+            optimizer.zero_grad(set_to_none=True)
 
-            optimizer.zero_grad()
+            with torch.autocast(device_type=DEVICE.type,
+                                dtype=torch.float16, enabled=USE_CUDA):
+                outputs = model(images).squeeze(1)
 
-            with torch.autocast(
-                device_type=DEVICE.type,
-                dtype=torch.float16,
-                enabled=DEVICE.type == "cuda"
-            ):
-
-                outputs = model(images)
-
-                loss = criterion(
-                    outputs,
-                    labels
-                )
+            loss = criterion(outputs.float(), labels)
 
             scaler.scale(loss).backward()
-
             scaler.step(optimizer)
-
             scaler.update()
 
             running_loss += loss.item()
+            progress.set_postfix(loss=loss.item())
 
-            progress.set_postfix(
-                loss=loss.item()
-            )
+        scheduler.step()
 
-        average_loss = running_loss / len(train_loader)
+        preds, labels_np = predict_raw(model, val_loader)
+        qwk = qwk_score(labels_np, preds)
 
-        qwk = validate(
-            model,
-            val_loader
-        )
-
-        print(
-            f"Epoch {epoch + 1}: "
-            f"Loss={average_loss:.4f}, "
-            f"Validation QWK={qwk:.4f}"
-        )
+        print(f"Epoch {epoch + 1}: Loss={running_loss / len(train_loader):.4f}, "
+              f"Validation QWK={qwk:.4f}")
 
         if qwk > best_qwk:
-
             best_qwk = qwk
-
             if save_path:
-
-                torch.save(
-                    {
-                        "model_state_dict": model.state_dict(),
-                        "qwk": best_qwk,
-                        "model_name": model_name,
-                        "dropout": dropout,
-                        "learning_rate": learning_rate,
-                        "weight_decay": weight_decay,
-                        "batch_size": batch_size,
-                        "epoch": epoch + 1
-                    },
-                    save_path
-                )
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "qwk": best_qwk,
+                    "thresholds": DEFAULT_THRESHOLDS,
+                    "task": "regression",
+                    "model_name": model_name,
+                    "dropout": dropout,
+                    "learning_rate": learning_rate,
+                    "weight_decay": weight_decay,
+                    "batch_size": batch_size,
+                    "epoch": epoch + 1
+                }, save_path)
 
     return best_qwk
 
 
 # --------------------------------------------------
-# 6. Hyperparameter optimisation
+# Optuna
 # --------------------------------------------------
 
 def objective(trial, model_name):
 
-    learning_rate = trial.suggest_float(
-        "learning_rate",
-        0.00001,
-        0.001,
-        log=True
-    )
+    lr = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+    wd = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
+    dropout = trial.suggest_float("dropout", 0.2, 0.5)
+    batch_size = trial.suggest_categorical("batch_size", BATCH_SIZES[model_name])
 
-    weight_decay = trial.suggest_float(
-        "weight_decay",
-        0.00001,
-        0.001,
-        log=True
-    )
-
-    dropout = trial.suggest_float(
-        "dropout",
-        0.2,
-        0.5
-    )
-
-    batch_size = trial.suggest_categorical(
-        "batch_size",
-        [2, 4]
-    )
-
-    qwk = train_model(
-        model_name=model_name,
-        learning_rate=learning_rate,
-        weight_decay=weight_decay,
-        dropout=dropout,
-        batch_size=batch_size,
-        epochs=EPOCHS_PER_TRIAL
-    )
-
-    return qwk
+    try:
+        return train_model(model_name, lr, wd, dropout,
+                           batch_size, EPOCHS_PER_TRIAL)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise optuna.TrialPruned()
 
 
 # --------------------------------------------------
-# 7. Main
+# Main
 # --------------------------------------------------
 
 def main():
 
     parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--model",
-        required=True,
-        choices=["resnet18", "efficientnet_b0"]
-    )
-
+    parser.add_argument("--model", required=True,
+                        choices=["resnet18", "efficientnet_b0"])
     args = parser.parse_args()
 
     model_name = args.model
-
     output_dir = MODEL_DIR / model_name
-
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print("Device:", DEVICE)
     print("Training:", model_name)
 
-    # Hyperparameter search
+    study = optuna.create_study(direction="maximize")
+    study.optimize(lambda t: objective(t, model_name), n_trials=N_TRIALS)
 
-    study = optuna.create_study(
-        direction="maximize"
-    )
-
-    study.optimize(
-        lambda trial: objective(
-            trial,
-            model_name
-        ),
-        n_trials=N_TRIALS
-    )
-
-    print("\nBest hyperparameters:")
-    print(study.best_params)
-
+    print("\nBest hyperparameters:", study.best_params)
     print("Best validation QWK:", study.best_value)
 
     study.trials_dataframe().to_csv(
-        output_dir / "optimization_results.csv",
-        index=False
+        output_dir / "optimization_results.csv", index=False
     )
 
-    # Final training using best hyperparameters
-
     best = study.best_params
-
     best_model_path = output_dir / "best_model.pth"
 
     print("\nTraining final model...")
-
     train_model(
         model_name=model_name,
         learning_rate=best["learning_rate"],
@@ -391,6 +293,25 @@ def main():
         epochs=FINAL_EPOCHS,
         save_path=best_model_path
     )
+
+    # Tune decision thresholds on validation with TTA, store in checkpoint
+    print("\nOptimising thresholds with TTA on validation set...")
+    ckpt = torch.load(best_model_path, map_location=DEVICE)
+    model = create_model(model_name, best["dropout"], pretrained=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+
+    _, val_loader = create_loaders(best["batch_size"])
+    preds, labels = predict_raw(model, val_loader, tta=True)
+
+    before = qwk_score(labels, preds)
+    thresholds, after = optimise_thresholds(preds, labels)
+    print(f"Val QWK (TTA, default thresholds): {before:.4f}")
+    print(f"Val QWK (TTA, tuned thresholds):   {after:.4f}")
+    print("Thresholds:", [round(t, 3) for t in thresholds])
+
+    ckpt["thresholds"] = thresholds
+    ckpt["qwk_tta_tuned"] = after
+    torch.save(ckpt, best_model_path)
 
     print("\nTraining completed.")
     print("Model saved:", best_model_path)
