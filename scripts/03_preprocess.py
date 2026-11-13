@@ -35,7 +35,7 @@ def preprocess_image(image):
         Image.Resampling.LANCZOS
     )
 
-    # Create a black 1024x1024 background.
+    # Create a black background.
     canvas = Image.new("RGB", IMAGE_SIZE, (0, 0, 0))
 
     # Centre the resized image without cropping.

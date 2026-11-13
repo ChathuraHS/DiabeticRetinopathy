@@ -10,7 +10,6 @@ Run the scripts in order:
 2. `scripts/02_split.py` creates stratified splits while keeping each patient's images in a single split.
 3. `scripts/03_preprocess.py` corrects image orientation, converts images to RGB, resizes with aspect ratio preserved, and saves padded JPEGs.
 4. `scripts/04_validate.py` checks processed images, labels, splits, and patient isolation.
-5. `scripts/05_eda.py` generates class-distribution and image-size plots.
 
 ## Data
 

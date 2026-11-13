@@ -296,7 +296,7 @@ def main():
 
     # Tune decision thresholds on validation with TTA, store in checkpoint
     print("\nOptimising thresholds with TTA on validation set...")
-    ckpt = torch.load(best_model_path, map_location=DEVICE)
+    ckpt = torch.load(best_model_path, map_location=DEVICE, weights_only=False)
     model = create_model(model_name, best["dropout"], pretrained=False)
     model.load_state_dict(ckpt["model_state_dict"])
 
