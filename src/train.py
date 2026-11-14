@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-
+import gc
 import numpy as np
 import pandas as pd
 import torch
@@ -27,14 +27,14 @@ USE_CUDA = DEVICE.type == "cuda"
 N_TRIALS = 6
 EPOCHS_PER_TRIAL = 4
 FINAL_EPOCHS = 25
-NUM_WORKERS = 4
+NUM_WORKERS = 3
 
 DEFAULT_THRESHOLDS = [0.5, 1.5, 2.5, 3.5]
 
-# Batch sizes that fit a 6 GB GPU with AMP at 512px
+# Batch sizes that fit a 6 GB GPU with AMP
 BATCH_SIZES = {
     "resnet18": [16, 32],
-    "efficientnet_b0": [8, 16],
+    "efficientnet_b0": [8],
 }
 
 torch.backends.cudnn.benchmark = True
@@ -229,6 +229,9 @@ def train_model(model_name, learning_rate, weight_decay, dropout,
                     "batch_size": batch_size,
                     "epoch": epoch + 1
                 }, save_path)
+    del model, optimizer, scheduler, scaler, train_loader, val_loader
+    gc.collect()
+    torch.cuda.empty_cache()
 
     return best_qwk
 

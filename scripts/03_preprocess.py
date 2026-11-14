@@ -4,6 +4,7 @@ import json
 import pandas as pd
 from PIL import Image, ImageOps
 from tqdm import tqdm
+import numpy as np
 
 
 PROJECT = Path(r"D:\DiabeticRetinopathy")
@@ -15,7 +16,7 @@ REPORT_DIR = PROJECT / "reports"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-IMAGE_SIZE = (512, 512)
+IMAGE_SIZE = (640, 640)
 JPEG_QUALITY = 95
 
 SPLITS = ["train", "validation", "test"]
@@ -23,27 +24,18 @@ SPLITS = ["train", "validation", "test"]
 from PIL import Image, ImageOps
 
 def preprocess_image(image):
-    # Correct EXIF orientation.
-    image = ImageOps.exif_transpose(image)
+    image = ImageOps.exif_transpose(image).convert("RGB")
 
-    # Convert to RGB.
-    image = image.convert("RGB")
+    # Crop black borders on the ORIGINAL before downscaling
+    mask = np.asarray(image).mean(axis=2) > 15
+    if mask.sum() > 100:
+        ys, xs = np.where(mask)
+        image = image.crop((xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
 
-    # Resize while preserving the entire image.
-    image.thumbnail(
-        IMAGE_SIZE,
-        Image.Resampling.LANCZOS
-    )
-
-    # Create a black background.
+    image.thumbnail(IMAGE_SIZE, Image.Resampling.LANCZOS)
     canvas = Image.new("RGB", IMAGE_SIZE, (0, 0, 0))
-
-    # Centre the resized image without cropping.
-    x = (IMAGE_SIZE[0] - image.width) // 2
-    y = (IMAGE_SIZE[1] - image.height) // 2
-
-    canvas.paste(image, (x, y))
-
+    canvas.paste(image, ((IMAGE_SIZE[0] - image.width) // 2,
+                         (IMAGE_SIZE[1] - image.height) // 2))
     return canvas
 
 

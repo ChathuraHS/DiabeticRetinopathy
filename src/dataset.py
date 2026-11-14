@@ -6,7 +6,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-IMAGE_SIZE = 512
+IMAGE_SIZE = 640
 MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
@@ -36,7 +36,8 @@ def crop_retina(img, threshold=15):
                       interpolation=cv2.INTER_AREA)
 
 
-def ben_graham(img, sigma=10):
+def ben_graham(img, sigma=None):
+    sigma = sigma or IMAGE_SIZE / 50
     """Subtract local average colour to highlight lesions."""
     blurred = cv2.GaussianBlur(img, (0, 0), sigma)
     img = cv2.addWeighted(img, 4, blurred, -4, 128)

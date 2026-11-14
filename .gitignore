@@ -1,7 +1,9 @@
 # Downloaded archives and dataset contents
 /downloads/
 /data/
-/reports/
+/reports/*
+!/reports/.gitignore
+/models/
 
 # Python environments and generated files
 .venv/

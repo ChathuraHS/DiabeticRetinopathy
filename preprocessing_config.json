@@ -1,7 +1,7 @@
 {
     "image_size": [
-        512,
-        512
+        640,
+        640
     ],
     "color_mode": "RGB",
     "format": "JPEG",
